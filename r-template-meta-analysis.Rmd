@@ -1,0 +1,508 @@
+---
+title: "Please change the title of the report"
+author: "Please enter your name"
+date: "`r Sys.Date()`"
+styler: yes
+output:
+  html_document:
+    code_folding: hide
+    number_sections: true
+    toc: yes
+    documentclass: report
+    toc_depth: 2
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+params:
+    # *Please* change the 'file_name' to exactly match your data file.
+    # *Please* ensure the data file is in the same directory as this code file.
+    # *Please* change the 'block' to the column name that represents your block of interest
+    # *Please* change the 'ref_trt' to indicate which string represents the reference group 
+    # *Please* change the 'trt_interest' to indicate which strings represents the treatments of interest
+    # *Please* change the 'measure' to indciate the column that represents the outcome variable  
+    #*Please* change the 'y_axis_string' to  the label for the graph representing the outcome variable
+    file_name: "study.csv" 
+    block: "study" 
+    ref_trt: "Control" 
+    trt_interest: !r c("Treatment A", "Treatment B") 
+    measure: "gr" 
+    y_axis_string: "Growth rate" 
+---
+
+
+# The Purpose
+
+The goal of this code is to enable a versatile and user-friendly R template
+script designed for conducting forest plot analyses, specifically tailored to 
+meet the needs of scientists. The template is intended to be sufficiently 
+generic, allowing for application to continuous outcome variables to estimate 
+the effect across a user-defined blocking variable.
+
+<!-- # Pre-read instructions -->
+
+<!-- The following are the required inputs for this code to run successfully. -->
+
+<!-- ## Data format:  -->
+<!--     1. Data in a long format with a single header (see example ...) -->
+<!--     2. Minimum columns are three columns:  outcome variabe,  block,   -->
+<!--         treatment (align the names) -->
+<!--     3. Note:  extra columns will be ignored.  -->
+<!--     4. Missing values are specified as empty cells  or NA without any quotes -->
+<!--     5. The outcome variable is a continuous quantitative variable -->
+<!--     6. The block variable is a variable that has a number of defined levels,  -->
+<!--         e.g., donor1, donor2, donor3 -->
+<!--     7. The treatment variable has a number of defined levels, e.g., ... -->
+
+
+<!-- ## Workflow: 4 step process  -->
+<!-- 1. *Please*, change the title and Name to generate a bespoke report -->
+<!-- 2. *Please*, define the *params*, see lines 16:29 above. -->
+<!--     Note in R, the format matters. Names that have additional spaces or captial -->
+<!--     letters will be treated as distinct.  -->
+<!-- 3. *Please*, ensure that you have copied and pasted `renv::restore()`in the R  -->
+<!-- console, and hit the `Enter` button to set up the correct package environment. -->
+<!-- 4. *Please*, activate the script by click on the Knit icon above.  --> 
+
+The following are the input arguments. Please, check and make sure your have 
+given the correct arguments.
+
+```{r input-args}
+str(params)
+```
+
+
+   
+```{r global-setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## Load functions -----------------------------------------------------------
+source("functions.R")
+options(repos = c(CRAN = "https://cran.rstudio.com"))
+
+## Type III sums of squares covers unbalanced design for welfare/other reasons.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+## Install and load packages ------------------------------------------------
+packages <- c(
+    "tidyverse", "emmeans", "here", "nlme", "pander", "metaviz", "devtools",
+    "metafor", "rstatix", "magrittr", "withr", "car", "broom", "broom.mixed",
+    "renv", "kableExtra"
+)
+install_load_packages(packages)
+
+## Colourblind-friendly colours for ggplot ----------------------------------
+cbb_palette <- c(
+  "#000000", "#E69F00", "#56B4E9", "#009E73",
+  "#F0E442", "#0072B2", "#D55E00", "#CC79A7"
+)
+
+# Save figures in a `figures` directory --------------------------------------
+if (dir.exists("figures")) unlink("figures", recursive = TRUE)
+dir.create("figures")
+
+# Save tables in a `tables` directory ----------------------------------------
+if (dir.exists("tables")) unlink("tables", recursive = TRUE)
+dir.create("tables")
+```
+
+
+
+# Import data
+
+```{r import-data}
+suppressWarnings(suppressMessages({
+    df <- read_csv(here::here(params$file_name))
+}))
+
+df %>% slice_head(n = 5) %>% 
+    kable(caption = "First five rows of the imported data", booktabs = TRUE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+# Manipulate data
+
+We split the data into relevant pairs for comparison. That is,  
+* Reference and Treatment 1  
+* Reference and Treatment 2  
+  ...  
+  ...  
+  ...  
+* Reference and Treatment n  
+
+
+```{r manipulate-data}
+# Fix variables for further analysis
+dt <- df %>%
+    rename_all(tolower) %>%
+    as_tibble() %>%
+    mutate_if(is.character, as_factor) %>%
+    dplyr::rename(block_var = params$block, measure = params$measure)
+
+
+cat("Structure of data")
+dt %>% distinct_if(is.factor) %>% pander()
+
+
+ref_trt <- params$ref_trt # reference treatment
+str_glue("Reference treatment: {ref_trt}")
+trt_interest <- params$trt_interest # treatments of interest 
+str_glue("Treatment of interest: {trt_interest}")
+
+
+# Split study into a combination of ref treatment and a treatment of interest
+dt_split_trt <- map(
+    trt_interest,
+    ~ filter(dt, treatment %in% c(ref_trt, .))
+) %>%
+    set_names(trt_interest)
+
+cat("First five observations in each `ref + treatment` data frame")
+dt_split_trt %>% 
+    map(~slice_sample(.x, n = 5)) %>% pander()
+```
+
+
+# Visualize/explore data by blocking variable
+
+```{r raw-data-plots}
+plot_raw_data <- create_boxplot(dt, params$y_axis_string) %>% 
+    print()
+
+ggsave("figures/raw-data-plot.png", plot = plot_raw_data, 
+       device = "png", width = 10, height = 7)
+```
+
+
+# Statistical analysis
+
+Below we fit linear regression, linear mixed effects and random effects meta-
+analysis. 
+The effects/means, adjusted for other variables in the models are provided, e.g., the treatment effects on tumor burden while adjusting for different 
+donors. 
+Also provided are comparisons between the average effect of treatments of 
+interest and the reference group.   
+
+The linear regression model was of the form,    
+
+**measure_of_interest ~ treatment + block + block:treatment**.   
+
+This model helps answer the questions,
+
+- how each `treatment` affects the `measure_of_interest`,   
+- how the `measure_of_interest` might vary across different `block`s, and    
+- whether the effectiveness of each `treatment` changes depending on the
+`block`, i.e., `block:treatment`.   
+
+The linear mixed regression model had the formula,   
+
+**measure_of_interest ~ treatment + (1 | block / treatment)**,   
+
+which models both the effects of interest (`treatment`s) and account for the
+variability that is not of primary interest but could influence the results,  
+i.e., the random effects of `block`s and their interaction with `treatment`s. 
+This approach helps ensure that the conclusions about treatment effects are as
+accurate and generalizable as possible.
+
+
+
+## Fit linear regression models (LM) and estimate0 treatment contrast  
+
+Here we fit a fixed effect model.  This means we are estimating the average 
+effect of treatment and comparing it to the unexplained variation after 
+adjusting for each block studied.  This is a robust method when there are not 
+many blocks.   
+
+The first output table for each treatment returns an estimate of the average 
+effect of the treatment of interest and the reference after adjusting for other variations in the model. You should look at the **emmeans**, the **SE** as a
+measure of precision, and the **p.value** columns.
+
+The second output table for each treatment returns an average estimate of the
+difference in the treatment effect compared to the reference, and you should
+look at the **estimate**d effect, the **SE** as a measure of precision, and the
+**p.value** columns.   
+
+```{r fit-linear-model, results = 'asis'}
+results_lm <- suppressMessages(
+    fit_lm_contrast_trt(dt_split_trt, trt_interest, ref_trt)
+) 
+
+process_results(results_lm)
+```
+
+
+
+## Fit linear mixed regression models and estimate treatment contrast
+
+Here we fit a mixed effects model accounting for the block as a random effect 
+which is normally distributed. This means we are estimating the average effect 
+of treatment and comparing to the unexplained variation and the variation for 
+block as a random effect. This gives us an estimate that uses the observed 
+block behaviour to estimate the population of blocks.   
+
+The first output table for each treatment returns an estimate of the average 
+effect of the treatment of interest and the reference after adjusting for other variations in the model. You should look at the **`emmeans`**, the **SE** as a
+measure of precision, and the **p.value** columns.
+
+The second output table for each treatment returns an average estimate of the
+contrast in the treatments of interest compared to the reference and you should 
+look at the **`estimate`**d effect, the SE as a measure of precision, and the p.value columns.   
+
+
+```{r fit-linear-mixed-model, results = 'asis'}
+results_lmm <- fit_lmm_contrast_trt(dt_split_trt)
+process_results(results_lmm)
+```
+
+
+
+## Diagnostic check of fitted LMM models
+
+**Residual** is the differences between that **Predicted** from the model and
+the observed value. The distribution of the residuals can help assess the 
+quality of the model. If the residuals versus the predicted are wedge shaped 
+then the model is predicting some readings well and others less so, and this 
+would be concerning.   
+
+In the QQ plot we would like to see the residuals randomly scattered around the 
+line indicating the distribution of the residuals is close to normal.  It is not
+unusual to have a few outliers at the tails. We would be concerned by a large 
+systematic deviation across the dynamic range. 
+
+
+```{r model-diagnostic-plots}
+# Extract LMM models
+lmm_models_only <- map(results_lmm, ~ .x[[1]])
+
+# Plot model diagnostics plots: Pearson residuals
+for (i in 1:length(dt_split_trt)) {
+  plt <- ResVpred(
+    dt_split_trt[[i]],
+    lmm_models_only[[i]],
+    "treatment",
+    "pearson",
+    trt_interest[[i]]
+  ) 
+  ggsave(
+    paste0("figures/resid v pred-", trt_interest[[i]], " by trt", ".png"),
+    plt
+  )
+}
+
+for (i in 1:length(dt_split_trt)) {
+  plt <- ResVpred(
+    dt_split_trt[[i]],
+    lmm_models_only[[i]],
+    "block_var",
+    "pearson",
+    trt_interest[[i]]
+  ) 
+  ggsave(
+    paste0("figures/resid v pred-", trt_interest[[i]], " by block", ".png"),
+    plt
+  )
+}
+
+# Plot model diagnostics plots: Q-Q plots
+model_names <- names(lmm_models_only)
+approach = "pearson"
+plt_qq <- pmap(
+    list(dt_split_trt, lmm_models_only, approach, model_names),
+    ~{
+        ResidualQQplot(..1, ..2, ..3, ..4)
+    }
+)
+
+plt_qq <- pmap(
+    list(dt_split_trt, lmm_models_only, approach, model_names),
+    ~{
+        png(str_glue("figures/qqplot-{..4}.png"), width = 800, height = 800)
+        ResidualQQplot(..1, ..2, ..3, ..4)
+        dev.off()
+    }
+)
+```
+
+
+
+## Collate output data from the LM and LMM models
+
+**treatment1** is the treatment of interest, and the statistics are estimates
+of its effect on the **measure of interest** holding other sources of variation
+constant.
+
+```{r lm-lmm-model-output, results = 'asis'}
+pmap(
+    list(lm = results_lm, lmm = results_lmm, trt_name = trt_interest),
+    function(lm, lmm, trt_name) {
+        # Get estimated model parameters
+        lm_fit <- summary(lm$model) %>%
+            tidy() %>%
+            add_column(model = "lm", .before = "term")
+        lmm_fit <- lmm$model %>%
+            broom::tidy() %>%
+            add_column(model = "lmm", .before = "effect")
+        shared_cols <- intersect(names(lm_fit), names(lmm_fit))
+        # Combine estimated model parameters
+        bind_rows(
+            lm_fit %>% select(all_of(shared_cols)), 
+            lmm_fit %>% select(all_of(shared_cols))
+        ) %>%
+            mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+            filter(str_detect(term, "treatment1$")) %>%
+            # Create and style table of estimated model parameters
+            kable(
+                .,
+                caption = str_glue("Treatment: {trt_name}"),
+                booktabs = TRUE,
+            ) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"))
+    }
+)
+```
+
+
+
+## Random effects meta-analysis
+
+Here we use a random effect meta analysis to conduct the analysis. This approach
+uses summary metrics for each block. This method is equivalent to the mixed 
+effect model but has been provided because for some communities it is more 
+widely used.   
+
+For each block, we have an estimate of the effect with 95% confidence interval.
+The size of the the block icon is proportional to the weight of the block in 
+relation to the pooled estimate. Blocks which have lower variation are given 
+more weight. At the bottom of the graph is a random effect pooled estimate. 
+
+```{r random-effects-meta-anal, results = 'asis', message=FALSE}
+df1_wide_lst <- map(dt_split_trt, ~ summariseMB_wide(.x))
+
+df1_wide_eff_est_lst <- df1_wide_lst %>%
+  map(~ escalc(
+    n1i = no_DP_V, n2i = no_DP_T,
+    m1i = mean_V, m2i = mean_T,
+    sd1i = SD_V, sd2i = SD_T,
+    data = .x, measure = "MD",
+    append = TRUE
+  ))
+
+r_ma_model_lst <- df1_wide_eff_est_lst %>% 
+    map(~ rma(yi, vi, data = .x))
+
+slabs <- df1_wide_eff_est_lst %>% 
+    pluck(1) %>% 
+    pull(block_var) %>% 
+    as.character()
+
+# Use map2 to iterate over the list and an index simultaneously
+invisible(
+    map2(r_ma_model_lst, trt_interest, ~{
+        fpath <- here::here("figures",
+                            str_glue("forest-plot-{.y}.png"))
+        png(fpath, width = 800, height = 600)
+        forest(.x, slab = slabs, main = .y)
+        dev.off()
+    })
+)
+forests <- map2(
+    r_ma_model_lst, trt_interest, 
+    ~ {
+        forest(.x, slab = slabs, main = .y)
+        }
+)
+```
+
+
+
+## Output data from the random effects meta-analysis model
+
+```{r ma-output, results = "asis", message=FALSE}
+dt_ma <- create_ma_output(r_ma_model_lst)
+
+dt_ma %>% imap(
+    ~ {
+        df <- .x %>%
+            rename(parameter = name, estimate = value) %>% 
+            filter(!parameter %in% c("I2", "testOfHet")) %>% 
+            kable(format = "pipe",
+                  caption =
+                      str_glue("R.E. meta.analysis For Treatment: {.y}")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"))
+    }
+)
+```
+
+
+## Assessing heterogeneity of response across the blocks
+
+We have also provided a heterogeneity measure, $I^2$.  This provides an 
+estimate of the proportion of variability in the meta-analysis that is explained 
+by differences between the blocks rather than by sampling error.
+
+$I^2$ indicates the level of heterogeneity. It ranges between 0-100%. If 
+$I^2$ ≤ 50%, blocks are considered homogeneous. If $I^2$ > 50%, the 
+heterogeneity is high.   
+
+The second row provides a statistical test of heterogeneity, **testOfHet**. 
+This is the Cochran's Q test, which tests whether the variability in the
+observed effect sizes or outcomes are larger than would be expected based on sampling variability alone. A significant test suggests that the true
+effects/outcomes are heterogeneous.
+
+```{r model-output-summary, results = "asis", message=FALSE}
+dt_ma %>% imap(
+    ~ {
+        df <- .x %>%
+            rename(parameter = name, estimate = value) %>% 
+            filter(parameter %in% c("I2", "testOfHet")) %>% 
+            kable(format = "pipe",
+                  caption =
+                      str_glue("R.E. meta.analysis For Treatment: {.y}")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"))
+    }
+)
+```
+
+
+
+## Variance component analysis of fixed effects model
+
+The proportion of variance for each term in the model was estimated from the
+fixed effect model.
+
+```{r model-variance-components, eval=FALSE}
+fixed_model <- lm(
+    measure ~ treatment + block_var + block_var * treatment,
+    data = dt,
+    na.action = "na.exclude"
+)
+anova_output <- anova(fixed_model)
+total_variance <- sum(anova_output$`Mean Sq`)
+table_output <- anova_output %>% 
+    as_tibble() %>% 
+    mutate(`variance%` = (`Mean Sq` / total_variance) * 100) %>% 
+    rename_with(~ tolower(.x), .cols = everything()) %>% 
+    add_column(
+        .before = "df", 
+        source = c("treatment", "block", 
+                    "treatment*block", "residuals")
+    )
+
+plt_vc <- ggplot(table_output, aes(x = "", y = `variance%`, fill = source)) +
+    geom_bar(stat = "identity", width = 1, color = "white") +
+    coord_polar("y", start = 0) +
+    scale_colour_manual(values = cbb_palette, aesthetics = "colour") +
+    theme_void() +
+    guides(fill = guide_legend(title = "Variation source"))
+ggsave("figures/variance-components.png", plt_vc)
+print(plt_vc)
+
+output_V <- dt %>%
+    filter(treatment == "PBS") %>%
+    group_by(block_var) %>%
+    get_summary_stats(measure,
+        type = "full",
+        show = c("n", "mean", "median", "sd")
+    )
+```
+
+
